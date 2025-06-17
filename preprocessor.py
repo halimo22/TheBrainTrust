@@ -241,20 +241,40 @@ class EEGPreprocessor:
         reconstructed_data = self.ica.inverse_transform(ica_cleaned)
         
         return reconstructed_data
+    def validate_data(self, data):
+        """Check for NaN, Inf, and constant channels before processing"""
+        # Check for NaN/Inf
+        if np.any(np.isnan(data)) or np.any(np.isinf(data)):
+            print(f"WARNING: Input data contains NaN/Inf values!")
+            return False
+        
+        # Check for constant channels
+        channel_stds = np.std(data, axis=0)
+        constant_channels = np.where(channel_stds < 1e-10)[0]
+        if len(constant_channels) > 0:
+            print(f"WARNING: Constant channels detected: {[self.eeg_channels[i] for i in constant_channels]}")
+            return False
     
+        return True
+    def check_for_nans(self, data, step_name):
+        """Check for NaN values and report"""
+        nan_count = np.sum(np.isnan(data))
+        if nan_count > 0:
+            nan_channels = np.any(np.isnan(data), axis=0)
+            bad_channels = [self.eeg_channels[i] for i, is_nan in enumerate(nan_channels) if is_nan]
+            print(f"ERROR at {step_name}: Found {nan_count} NaN values in channels: {bad_channels}")
+            return True
+        return False
     def standardize_data(self, data):
-        """
-        Standardize EEG data (z-score normalization)
-        
-        Parameters:
-        data: numpy array, EEG data (samples x channels)
-        
-        Returns:
-        standardized_data: numpy array, standardized EEG data
-        """
+        """Standardize EEG data with protection against zero variance"""
         standardized_data = np.zeros_like(data)
         for i in range(data.shape[1]):
-            standardized_data[:, i] = zscore(data[:, i])
+            channel_std = np.std(data[:, i])
+            if channel_std < 1e-10:  # Essentially zero variance
+                print(f"Warning: Channel {self.eeg_channels[i]} has near-zero variance, skipping standardization")
+                standardized_data[:, i] = data[:, i] - np.mean(data[:, i])
+            else:
+                standardized_data[:, i] = zscore(data[:, i])
         
         return standardized_data
     
@@ -283,8 +303,11 @@ class EEGPreprocessor:
         preprocessed_data: numpy array, preprocessed EEG data
         preprocessing_info: dict, information about preprocessing steps
         """
-        # Extract EEG channels
         eeg_data = trial_data[self.eeg_channels].values
+    
+        # Initial validation
+        if not self.validate_data(eeg_data):
+            print("Initial data validation failed!")
         
         preprocessing_info = {
             'original_shape': eeg_data.shape,
@@ -295,13 +318,16 @@ class EEGPreprocessor:
         
         print(f"Starting preprocessing for trial with shape: {eeg_data.shape}")
         
+        # Check after each step
+        self.check_for_nans(eeg_data, "Initial data")
+        
         # Step 1: Bandpass filtering
         if apply_bandpass:
             eeg_data = self.bandpass_filter(eeg_data, low_freq=1.0, high_freq=40.0)
+            self.check_for_nans(eeg_data, "After bandpass filter")
             preprocessing_info['preprocessing_steps'].append('Bandpass filter (1-40 Hz)')
             print("✓ Applied bandpass filter (1-40 Hz)")
-        
-        # Step 2: Notch filtering
+            # Step 2: Notch filtering
         if apply_notch:
             eeg_data = self.notch_filter(eeg_data, notch_freq=50.0)
             preprocessing_info['preprocessing_steps'].append('Notch filter (50 Hz)')
@@ -323,6 +349,24 @@ class EEGPreprocessor:
                 preprocessing_info['preprocessing_steps'].append(f'Bad channel interpolation ({len(bad_channels)} channels)')
             else:
                 print("✓ No bad channels detected")
+        if apply_ica_flag:
+            # Handle NaN/Inf values
+            if np.any(np.isnan(eeg_data)) or np.any(np.isinf(eeg_data)):
+                print("⚠ NaN or Inf detected in data before ICA. Applying np.nan_to_num.")
+                eeg_data = np.nan_to_num(eeg_data, nan=0.0, posinf=np.finfo(eeg_data.dtype).max, neginf=np.finfo(eeg_data.dtype).min)
+
+            # Handle constant channels (zero variance)
+            stds = np.std(eeg_data, axis=0)
+            if np.any(stds < 1e-9): # Using a small threshold for near-zero variance
+                constant_channel_indices = np.where(stds < 1e-9)[0]
+                print(f"⚠ Constant channel(s) detected at indices: {constant_channel_indices} before ICA. Adding small noise.")
+                for ch_idx in constant_channel_indices:
+                    eeg_data[:, ch_idx] += np.random.normal(0, 1e-7, size=eeg_data.shape[0])
+                
+                # Re-check if ICA is still viable, or skip if too many channels are bad
+                if np.sum(np.std(eeg_data, axis=0) < 1e-9) >= eeg_data.shape[1] -1 : # If almost all channels are still constant
+                    print("‼ Too many constant channels even after adding noise. Skipping ICA for this trial.")
+                    apply_ica_flag = False
         
         # Step 5: ICA for artifact removal
         if apply_ica_flag:
